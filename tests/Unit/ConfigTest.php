@@ -1,26 +1,13 @@
 <?php
 
-namespace GeneroWP\AuditLog\Tests;
+namespace GeneroWP\AuditLog\Tests\Unit;
 
 use GeneroWP\AuditLog\Config;
-use PHPUnit\Framework\TestCase;
+use GeneroWP\AuditLog\Recorder;
+use GeneroWP\AuditLog\Tests\TestCase;
 
 class ConfigTest extends TestCase
 {
-    public static function config(array $overrides = []): Config
-    {
-        return new Config(...$overrides + [
-            'environment' => 'production',
-            'site' => 'example',
-            'bucket' => 'genero-audit-logs',
-            'accessId' => 'GOOG1EXAMPLE',
-            'secret' => 'secret',
-            'hosts' => ['example.fi', 'www.example.fi'],
-            'logDir' => null,
-            'chatWebhook' => null,
-        ]);
-    }
-
     public function test_active_only_in_production_with_credentials_and_hosts(): void
     {
         $this->assertTrue(self::config()->isActive());
@@ -28,6 +15,17 @@ class ConfigTest extends TestCase
         $this->assertFalse(self::config(['environment' => 'development'])->isActive());
         $this->assertFalse(self::config(['secret' => ''])->isActive());
         $this->assertFalse(self::config(['hosts' => []])->isActive());
+    }
+
+    public function test_plugin_is_inactive_in_this_environment(): void
+    {
+        $this->assertFalse(Config::fromEnvironment()->isActive());
+
+        $recorders = array_filter(
+            array_merge(...array_values($GLOBALS['wp_filter']['shutdown']->callbacks ?? [])),
+            fn (array $hook) => is_array($hook['function']) && $hook['function'][0] instanceof Recorder,
+        );
+        $this->assertSame([], $recorders);
     }
 
     public function test_host_check_is_case_insensitive_and_exact(): void

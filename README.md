@@ -87,8 +87,11 @@ therefore stays inactive.
 
 ## Development
 
+Tests run against a real WordPress in [wp-env](https://www.npmjs.com/package/@wordpress/env):
+
 ```bash
 composer install
-composer test
+npx @wordpress/env start
+composer test:wp-env
 composer lint
 ```

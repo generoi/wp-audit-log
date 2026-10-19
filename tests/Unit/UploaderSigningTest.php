@@ -1,11 +1,11 @@
 <?php
 
-namespace GeneroWP\AuditLog\Tests;
+namespace GeneroWP\AuditLog\Tests\Unit;
 
+use GeneroWP\AuditLog\Tests\TestCase;
 use GeneroWP\AuditLog\Uploader;
-use PHPUnit\Framework\TestCase;
 
-class UploaderTest extends TestCase
+class UploaderSigningTest extends TestCase
 {
     private function headers(array $overrides = []): array
     {

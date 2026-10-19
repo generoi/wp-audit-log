@@ -8,10 +8,11 @@ on:
 
 env:
   PHP_VERSION: '8.3'
+  NODE_VERSION: '22'
 
 jobs:
-  test:
-    name: Lint and test
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,4 +25,25 @@ jobs:
 
       - run: composer lint
 
-      - run: composer test
+  test:
+    name: PHPUnit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction
+
+      - name: Start wp-env
+        run: npx @wordpress/env start
+
+      - name: Run PHPUnit
+        run: npx @wordpress/env run tests-cli --env-cwd=wp-content/plugins/wp-audit-log vendor/bin/phpunit

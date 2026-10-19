@@ -70,8 +70,9 @@ class LogShipper
     }
 
     /**
-     * Runs from the hourly cron and from admin requests, so a site whose cron
-     * has stopped still raises the alarm the next time someone opens wp-admin.
+     * Reports uploads that keep failing while cron is running. A site that
+     * stops running cron altogether is caught by the external daily check
+     * of the bucket instead.
      */
     public function checkHealth(): void
     {

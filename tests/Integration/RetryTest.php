@@ -1,17 +1,21 @@
 <?php
 
-namespace GeneroWP\AuditLog\Tests;
+namespace GeneroWP\AuditLog\Tests\Integration;
 
 use GeneroWP\AuditLog\Retry;
+use GeneroWP\AuditLog\Tests\TestCase;
 use GeneroWP\AuditLog\Uploader;
 
-class RetryTest extends StubbedTestCase
+class RetryTest extends TestCase
 {
-    public function test_queue_is_not_autoloaded_on_single_site(): void
+    public function test_queue_is_not_autoloaded(): void
     {
+        global $wpdb;
+
         Retry::push('example/a', 'x');
 
-        $this->assertFalse($GLOBALS['wp_stub']['autoload']['wp_audit_log_retry']);
+        $autoload = $wpdb->get_var("SELECT autoload FROM {$wpdb->options} WHERE option_name = 'wp_audit_log_retry'");
+        $this->assertContains($autoload, ['no', 'off']);
     }
 
     public function test_queue_keeps_the_newest_500(): void
@@ -31,7 +35,7 @@ class RetryTest extends StubbedTestCase
         Retry::push('example/a', 'a');
         Retry::push('example/b', 'b');
 
-        $this->assertTrue(Retry::flush(new Uploader($this->config())));
+        $this->assertTrue(Retry::flush(new Uploader(self::config())));
         $this->assertSame(0, Retry::count());
         $this->assertCount(2, $this->uploads());
     }
@@ -43,7 +47,7 @@ class RetryTest extends StubbedTestCase
         Retry::push('example/c', 'c');
 
         $this->respond(200, 503);
-        $this->assertFalse(Retry::flush(new Uploader($this->config())));
+        $this->assertFalse(Retry::flush(new Uploader(self::config())));
 
         $this->assertSame(['example/b', 'example/c'], array_keys(get_option('wp_audit_log_retry')));
     }

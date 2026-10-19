@@ -1,9 +1,9 @@
 <?php
 
-namespace GeneroWP\AuditLog\Tests;
+namespace GeneroWP\AuditLog\Tests\Unit;
 
 use GeneroWP\AuditLog\Redactor;
-use PHPUnit\Framework\TestCase;
+use GeneroWP\AuditLog\Tests\TestCase;
 
 class RedactorTest extends TestCase
 {
