@@ -1,0 +1,8 @@
+/vendor/
+/composer.lock
+patches.lock.json
+/node_modules/
+/build/
+.DS_Store
+composer.phar
+.phpunit.result.cache

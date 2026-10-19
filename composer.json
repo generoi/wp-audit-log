@@ -1,0 +1,40 @@
+{
+  "name": "generoi/wp-audit-log",
+  "type": "wordpress-muplugin",
+  "license": "MIT",
+  "description": "Ships Kinsta access logs and per-request user identity to write-only Google Cloud Storage for incident forensics.",
+  "homepage": "https://github.com/generoi/wp-audit-log",
+  "authors": [
+    {
+      "name": "Genero",
+      "email": "info@genero.fi"
+    }
+  ],
+  "require": {
+    "php": ">=8.3.0"
+  },
+  "require-dev": {
+    "laravel/pint": "^1.29",
+    "phpunit/phpunit": "^9.6"
+  },
+  "autoload": {
+    "psr-4": {
+      "GeneroWP\\AuditLog\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "GeneroWP\\AuditLog\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "lint": "pint --test",
+    "lint:fix": "pint",
+    "test": "phpunit"
+  },
+  "config": {
+    "platform": {
+      "php": "8.3.30"
+    }
+  }
+}
