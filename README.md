@@ -12,15 +12,22 @@ credentials were used, and from where.
   application password or WooCommerce API key, one record with the user, the
   credential (cookie session hash, application password UUID or API key ID),
   the POST action and IDs, and REST sub-requests.
-- **Events:** logins, failed logins, logouts, password resets, application
-  passwords created, used, rejected or deleted, users created or deleted, role
-  and credential changes, plugin and theme changes, watched options, order
-  status changes and refunds.
+- **Events:** logins, auth cookies issued, failed logins, logouts, password
+  resets, application passwords created, used, rejected or deleted, rejected
+  WooCommerce API keys, users created or deleted, role, role definition and
+  credential changes, plugin and theme changes, watched site and network
+  options, order status changes and refunds.
 
-Content is never recorded, only identifiers. What a request read comes from
-the access log: join a record to its log line on `ip`, `method` and `uri`,
-with the log timestamp within a few seconds after `request_time` (nginx
-logs when the response finishes).
+Page and record content is not recorded, only identifiers. Records do contain
+personal data and whatever the URL carries: user logins, IP addresses, user
+agents, query strings such as search terms, and old and new values of watched
+options such as `admin_email`. Known credential parameters are redacted, and
+the query string is otherwise kept so a record still joins to its log line.
+
+What a request read comes from the access log: join a record to its log line on
+`ip`, `method` and `uri`, with the log timestamp within a few seconds after
+`request_time` (nginx logs when the response finishes). REST sub-requests carry
+their response `status`, so a denied call can be told from a successful one.
 
 Failed logins keep the username only if the account exists; anything else is
 stored as `username_sha256`, since people regularly type their password into
@@ -31,8 +38,13 @@ the username field.
 Each recorded request makes one upload after the response has been sent, so
 visitors don't wait, but the PHP worker stays busy for the upload (typically
 100–300 ms). After a failed upload, uploads pause for five minutes and events
-queue for the hourly retry, so an outage can't tie up workers. Frontend
-browsing by signed-in customers is not recorded.
+queue for the hourly retry, so an outage can't tie up workers. Failed logins,
+rejected application passwords and rejected API keys always go through that
+queue, so they reach the bucket within about an hour.
+
+Page views by signed-in customers, WordPress Heartbeat, and Store API cart
+calls are not recorded. Other admin-ajax and REST calls from signed-in
+customers are.
 
 ## Storage
 
@@ -45,8 +57,9 @@ browsing by signed-in customers is not recorded.
 
 Each site has its own service account with Storage Object Creator on its own
 managed folder: it can upload but not list, read, overwrite or delete. Objects
-are locked for 6 months and deleted after 2 years. Reads and deletes of the
-bucket are themselves logged to the `storage-audit-trail` log bucket.
+are retained for 6 months (the policy gets locked after the pilot) and deleted
+after 2 years. Reads and deletes of the bucket are themselves logged to the
+`storage-audit-trail` log bucket.
 
 ## Installation
 
@@ -80,10 +93,12 @@ bin/onboard-site.sh <site> <host>[,<host>...]
 | `AUDIT_LOG_DIR` | Optional: overrides the detected Kinsta `logs/` directory |
 | `AUDIT_LOG_BUCKET` | Optional: defaults to `genero-audit-logs` |
 
-The plugin does nothing unless `WP_ENV` is `production`, and it only records
-requests whose `Host` is in `AUDIT_LOG_HOSTS` and only uploads log files that
-contain those hosts. A copied `.env`, on a Kinsta staging restore or in DDEV,
-therefore stays inactive.
+The plugin does nothing unless `WP_ENV` is `production` and this server's own
+access log shows traffic for a host in `AUDIT_LOG_HOSTS`. A copied `.env`, on a
+Kinsta staging restore or in DDEV, therefore stays inactive, because those
+environments have other hosts in their logs, or no logs at all. On live,
+requests through any hostname are recorded, including the Kinsta temporary
+domain, and each record shows its `host`.
 
 ## Development
 

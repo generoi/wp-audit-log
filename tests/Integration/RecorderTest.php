@@ -3,6 +3,7 @@
 namespace GeneroWP\AuditLog\Tests\Integration;
 
 use GeneroWP\AuditLog\Recorder;
+use GeneroWP\AuditLog\Retry;
 use GeneroWP\AuditLog\Tests\TestCase;
 use GeneroWP\AuditLog\Uploader;
 use WP_Application_Passwords;
@@ -33,6 +34,8 @@ class RecorderTest extends TestCase
             'user_pass' => 'correct-horse',
             'role' => 'administrator',
         ]);
+
+        $this->log('access.log', self::line('www.example.fi'));
 
         $config = $this->siteConfig();
         $this->recorder = new Recorder($config, new Uploader($config));
@@ -71,6 +74,11 @@ class RecorderTest extends TestCase
         set_current_screen('dashboard');
     }
 
+    private function flushQueue(): void
+    {
+        Retry::flush(new Uploader($this->siteConfig()));
+    }
+
     private function allowApplicationPasswords(): void
     {
         add_filter('wp_is_application_passwords_available', '__return_true');
@@ -84,11 +92,12 @@ class RecorderTest extends TestCase
 
         $this->recorder->flush();
 
-        $login = $this->uploadedRecords()[0];
+        $records = array_column($this->uploadedRecords(), null, 'event');
+        $login = $records['login'];
         $sessions = get_user_meta($this->userId, 'session_tokens', true);
 
-        $this->assertSame('login', $login['event']);
         $this->assertArrayHasKey($login['data']['session'], $sessions, 'the hash is the verifier WordPress stores');
+        $this->assertSame($login['data']['session'], $records['auth_cookie_issued']['data']['session']);
         $this->assertSame('http', $login['context']);
         $this->assertSame('1.2.3.4', $login['ip']);
     }
@@ -124,6 +133,8 @@ class RecorderTest extends TestCase
         wp_signon(['user_login' => 'hunter2-typed-as-username', 'user_password' => 'wrong']);
 
         $this->recorder->flush();
+        $this->assertSame([], $this->uploads(), 'failed logins wait for the hourly upload');
+        $this->flushQueue();
 
         [$real, $unknown] = $this->uploadedRecords();
         $this->assertSame(['username' => 'editor'], $real['data']);
@@ -145,7 +156,7 @@ class RecorderTest extends TestCase
         $records = array_column($this->uploadedRecords(), null, 'event');
         $this->assertSame($item['uuid'], $records['application_password_created']['data']['uuid']);
         $this->assertSame(['method' => 'application_password', 'uuid' => $item['uuid']], $records['request']['credential']);
-        $this->assertSame([['method' => 'GET', 'route' => '/wp/v2/users/me', 'id' => null]], $records['request']['data']['rest']);
+        $this->assertSame([['method' => 'GET', 'route' => '/wp/v2/users/me', 'id' => null, 'status' => 200]], $records['request']['data']['rest']);
     }
 
     public function test_rejected_application_password_is_recorded(): void
@@ -177,26 +188,103 @@ class RecorderTest extends TestCase
         $this->inAdmin();
         $_SERVER['SCRIPT_NAME'] = '/wp/wp-admin/admin-ajax.php';
 
-        foreach (['as_async_request_queue_runner', 'wp_1_wc_privacy_cleanup'] as $action) {
+        foreach (['as_async_request_queue_runner', 'heartbeat', 'wp_1_wc_privacy_cleanup'] as $action) {
             $_REQUEST['action'] = $action;
             $this->recorder->flush();
         }
         $this->assertSame([], $this->uploads());
 
-        $_REQUEST['action'] = $_POST['action'] = 'heartbeat';
+        $_REQUEST['action'] = $_POST['action'] = 'gf_process_export';
         $_SERVER['REQUEST_METHOD'] = 'POST';
         $this->recorder->flush();
-        $this->assertSame(['action' => 'heartbeat'], $this->uploadedRecords()[0]['data']['params']);
+        $this->assertSame(['action' => 'gf_process_export'], $this->uploadedRecords()[0]['data']['params']);
     }
 
-    public function test_requests_for_other_hosts_are_dropped(): void
+    public function test_only_pure_cart_calls_count_as_cart_calls(): void
     {
+        $this->assertTrue(Recorder::onlyCartCalls([
+            ['route' => '/wc/store/v1/batch'],
+            ['route' => '/wc/store/v1/cart/add-item'],
+        ]));
+        $this->assertFalse(Recorder::onlyCartCalls([
+            ['route' => '/wc/store/v1/batch'],
+            ['route' => '/wc/store/v1/checkout'],
+        ]));
+        $this->assertFalse(Recorder::onlyCartCalls([['route' => '/wc/store/v1/order/55']]));
+        $this->assertFalse(Recorder::onlyCartCalls([]));
+    }
+
+    public function test_requests_on_a_staging_server_are_dropped(): void
+    {
+        $this->log('access.log', self::line('stg-example-staging.kinsta.cloud'));
         $_SERVER['HTTP_HOST'] = 'stg-example-staging.kinsta.cloud';
-        wp_signon(['user_login' => 'editor', 'user_password' => 'wrong']);
+        (new \WP_User($this->userId))->set_role('editor');
 
         $this->recorder->flush();
 
         $this->assertSame([], $this->uploads());
+    }
+
+    public function test_live_requests_through_another_hostname_are_recorded(): void
+    {
+        $_SERVER['HTTP_HOST'] = 'example.kinsta.cloud:37126';
+        (new \WP_User($this->userId))->set_role('editor');
+
+        $this->recorder->flush();
+
+        $this->assertSame('example.kinsta.cloud', $this->uploadedRecords()[0]['host']);
+    }
+
+    public function test_denied_rest_calls_record_their_status(): void
+    {
+        $this->signIn();
+        $this->inAdmin();
+        $request = new WP_REST_Request('GET', '/wc/v3/orders/55');
+        $request->set_param('id', 55);
+
+        $this->recorder->onRestCall(new \WP_Error('forbidden', 'no', ['status' => 403]), null, $request);
+        $this->recorder->flush();
+
+        $this->assertSame(403, $this->uploadedRecords()[0]['data']['rest'][0]['status']);
+    }
+
+    public function test_rejected_woocommerce_key_is_recorded(): void
+    {
+        $error = new \WP_Error('woocommerce_rest_authentication_error', 'Consumer key is invalid.', ['status' => 401]);
+
+        $this->assertSame($error, apply_filters('rest_authentication_errors', $error));
+        $this->recorder->flush();
+        $this->flushQueue();
+
+        $this->assertSame('woocommerce_key_failed', $this->uploadedRecords()[0]['event']);
+    }
+
+    public function test_role_grants_and_role_definition_changes_are_recorded(): void
+    {
+        global $wpdb;
+
+        $user = new \WP_User($this->userId);
+        $user->add_role('editor');
+        $user->remove_role('editor');
+        do_action('updated_option', $wpdb->prefix.'user_roles', [], []);
+        do_action('update_site_option', 'site_admins', ['evil'], ['editor']);
+
+        $this->recorder->flush();
+
+        $events = array_column($this->uploadedRecords(), 'data', 'event');
+        $this->assertSame('editor', $events['role_added']['role']);
+        $this->assertSame('editor', $events['role_removed']['role']);
+        $this->assertArrayHasKey('role_definitions_changed', $events);
+        $this->assertSame(['option' => 'site_admins', 'old' => ['editor'], 'new' => ['evil']], $events['network_option_updated']);
+    }
+
+    public function test_auth_cookie_without_wp_login_is_recorded(): void
+    {
+        wp_set_auth_cookie($this->userId);
+
+        $this->recorder->flush();
+
+        $this->assertSame($this->userId, array_column($this->uploadedRecords(), 'data', 'event')['auth_cookie_issued']['target_user_id']);
     }
 
     public function test_cron_on_a_server_without_live_traffic_is_dropped(): void
@@ -251,12 +339,12 @@ class RecorderTest extends TestCase
 
     public function test_failed_upload_goes_to_the_retry_queue(): void
     {
-        wp_signon(['user_login' => 'editor', 'user_password' => 'wrong']);
+        (new \WP_User($this->userId))->set_role('editor');
         $this->respond(503);
 
         $this->recorder->flush();
 
-        $this->assertCount(1, get_option('wp_audit_log_retry'));
+        $this->assertSame(1, Retry::count());
     }
 
     public function test_hooks_fired_with_missing_arguments_do_not_fatal(): void

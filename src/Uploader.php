@@ -33,6 +33,16 @@ class Uploader
 
     public function __construct(private Config $config) {}
 
+    public function eventObject(): string
+    {
+        return sprintf(
+            '%s/events/%s/%s.ndjson',
+            $this->config->site,
+            gmdate('Y-m-d/H'),
+            gmdate('His').'-'.bin2hex(random_bytes(8)),
+        );
+    }
+
     /**
      * @return self::CREATED|self::EXISTS|self::FAILED
      */

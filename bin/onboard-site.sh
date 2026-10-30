@@ -5,6 +5,8 @@
 #   bin/onboard-site.sh <site> <host>[,<host>...]
 #   bin/onboard-site.sh example example.fi,www.example.fi,www.example.se
 #
+# Set AUDIT_LOG_CHAT_WEBHOOK to include the upload-failure alert webhook.
+#
 # The site gets its own service account holding Storage Object Creator on its
 # own managed folder only: it can upload, but cannot list, read, overwrite or
 # delete anything, its own folder included. Run it as a project owner.
@@ -53,4 +55,10 @@ AUDIT_LOG_SITE='$site'
 AUDIT_LOG_HOSTS='$hosts'
 AUDIT_LOG_ACCESS_ID='$access_id'
 AUDIT_LOG_SECRET='$secret'
+AUDIT_LOG_CHAT_WEBHOOK='${AUDIT_LOG_CHAT_WEBHOOK:-}'
 EOF
+
+if [[ -z ${AUDIT_LOG_CHAT_WEBHOOK:-} ]]; then
+  echo >&2
+  echo "AUDIT_LOG_CHAT_WEBHOOK is empty: fill it in, or upload failures only reach error_log." >&2
+fi

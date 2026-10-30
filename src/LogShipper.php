@@ -24,6 +24,9 @@ class LogShipper
 
     private const STALE_AFTER = 36 * 3600;
 
+    /** The compressed file is held in memory; a fatal here would repeat every hour. */
+    private const MAX_BODY = 64 * 1024 * 1024;
+
     public function __construct(private Config $config, private Uploader $uploader) {}
 
     public function run(): void
@@ -35,10 +38,16 @@ class LogShipper
             return;
         }
 
+        // A staging copy stays silent. A wrong AUDIT_LOG_HOSTS on live looks
+        // the same from here, and is caught by the external check of the bucket.
+        if (! self::servesHosts($dir, $this->config)) {
+            return;
+        }
+
         $files = self::rotatedFiles($dir);
         // Forget files Kinsta has already deleted, so the option stays small.
         $shipped = array_intersect_key(get_site_option(self::SHIPPED, []), array_flip($files));
-        $ok = true;
+        $uploaded = false;
 
         foreach ($files as $file) {
             if (isset($shipped[$file])) {
@@ -47,23 +56,30 @@ class LogShipper
 
             $result = $this->ship($dir, $file);
             if ($result === null) {
-                $ok = false;
-
                 continue;
             }
             if ($result === Uploader::FAILED) {
                 // Storage is unreachable or refusing us; the rest would fail too.
-                $ok = false;
                 break;
             }
+            $uploaded = true;
             $shipped[$file] = time();
+            // Saved per file, so a run that dies on a later file keeps its progress.
+            update_site_option(self::SHIPPED, $shipped);
         }
 
         update_site_option(self::SHIPPED, $shipped);
 
-        $ok = Retry::flush($this->uploader) && $ok;
-        if ($ok) {
+        // Only a real upload counts: finding no files to ship must eventually
+        // alert, in case Kinsta changes how it names or stores rotated logs.
+        if ($uploaded) {
             update_site_option(self::LAST_SUCCESS, time());
+        }
+
+        Retry::flush($this->uploader);
+        $dropped = Retry::trim();
+        if ($dropped) {
+            $this->notify('retry-dropped', "dropped the {$dropped} oldest queued event batches.");
         }
 
         $this->checkHealth();
@@ -96,20 +112,12 @@ class LogShipper
     private function ship(string $dir, string $file): ?string
     {
         preg_match(self::ROTATED, $file, $match);
-        $packed = self::pack("{$dir}/{$file}", $this->config);
+        $packed = self::pack("{$dir}/{$file}");
 
         if ($packed === null) {
             // Skip rather than stop, so one bad file can't hold back the rest
             // until Kinsta deletes them.
-            $this->notify('unreadable', "cannot read {$file}.");
-
-            return null;
-        }
-
-        if ($packed['allowed_lines'] === 0) {
-            // Either AUDIT_LOG_HOSTS is wrong, or this file is not this site's
-            // traffic at all. Never upload it under this site's name.
-            $this->notify('foreign-hosts', "{$file} has no lines for AUDIT_LOG_HOSTS; not uploaded.");
+            $this->notify('unreadable', "cannot read {$file}, or it is too large.");
 
             return null;
         }
@@ -124,9 +132,9 @@ class LogShipper
      * output is held in memory. The hash is of the redacted plain text and
      * becomes part of the object name, so a name can't be claimed in advance.
      *
-     * @return array{body: string, sha256: string, allowed_lines: int}|null
+     * @return array{body: string, sha256: string}|null null when unreadable or over MAX_BODY
      */
-    public static function pack(string $path, Config $config): ?array
+    public static function pack(string $path, int $maxBody = self::MAX_BODY): ?array
     {
         $handle = @fopen($path, 'rb');
         if (! $handle) {
@@ -136,21 +144,23 @@ class LogShipper
         $deflate = deflate_init(ZLIB_ENCODING_GZIP, ['level' => 6]);
         $hash = hash_init('sha256');
         $body = '';
-        $allowed = 0;
 
         while (($line = fgets($handle)) !== false) {
             $line = Redactor::redact($line);
-            if ($config->allowsHost(strtok($line, ' ') ?: '')) {
-                $allowed++;
-            }
             hash_update($hash, $line);
             $body .= deflate_add($deflate, $line, ZLIB_NO_FLUSH);
+
+            if (strlen($body) > $maxBody) {
+                fclose($handle);
+
+                return null;
+            }
         }
         fclose($handle);
 
         $body .= deflate_add($deflate, '', ZLIB_FINISH);
 
-        return ['body' => $body, 'sha256' => hash_final($hash), 'allowed_lines' => $allowed];
+        return ['body' => $body, 'sha256' => hash_final($hash)];
     }
 
     /**
@@ -194,7 +204,11 @@ class LogShipper
      * Whether this server's own nginx log shows live traffic. Unlike .env and
      * the database, the logs directory belongs to the Kinsta environment and is
      * not copied by a backup restore, so a staging copy whose .env still
-     * says WP_ENV=production and WP_HOME=<live domain> fails this check.
+     * says WP_ENV=production and WP_HOME=<live domain> fails this check, and
+     * so does DDEV, which has no such directory.
+     *
+     * Every file on disk counts, so traffic on another hostname, such as the
+     * Kinsta temporary domain, can't push the live hosts out of the tail.
      */
     public static function servesHosts(string $dir, Config $config): bool
     {
@@ -210,16 +224,11 @@ class LogShipper
             $tail = (string) stream_get_contents($handle);
             fclose($handle);
 
-            if ($tail === '') {
-                continue;
-            }
             foreach (explode("\n", $tail) as $line) {
                 if ($config->allowsHost(strtok($line, ' ') ?: '')) {
                     return true;
                 }
             }
-
-            return false;
         }
 
         return false;
