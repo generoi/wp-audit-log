@@ -17,13 +17,23 @@ class Recorder
     /** Options whose changes alter who can get into the site. */
     private const WATCHED_OPTIONS = ['admin_email', 'default_role', 'home', 'siteurl', 'users_can_register'];
 
+    /** Network options with the same effect on multisite. */
+    private const WATCHED_NETWORK_OPTIONS = ['active_sitewide_plugins', 'admin_email', 'registration', 'site_admins'];
+
     /**
-     * Background-job loopbacks that WordPress sends to itself with the current
+     * Admin-ajax calls that repeat without anyone acting: Heartbeat, and the
+     * background-job loopbacks WordPress sends to itself with the current
      * user's cookie, every few seconds while a queue has work. They are still
      * in the access log; recording them here would only bury real requests.
      * WP_Background_Process names its actions wp_{blog_id}_{name}.
      */
-    private const LOOPBACK_ACTIONS = '/^(as_async_request_queue_runner|wp_\d+_[a-z0-9_]+)$/';
+    private const NOISE_ACTIONS = '/^(as_async_request_queue_runner|heartbeat|wp_\d+_[a-z0-9_]+)$/';
+
+    /** Store API routes that a signed-in customer's cart calls on page views. */
+    private const CART_ROUTES = '#^/wc/store(/v\d+)?/(cart|batch)(/|$)#';
+
+    /** Queued for the hourly upload, because anyone can trigger these at volume. */
+    private const QUEUED_EVENTS = ['application_password_failed', 'login_failed', 'woocommerce_key_failed'];
 
     /** POST fields that carry the action or the IDs it acts on, never content. */
     private const POST_FIELDS = ['action', 'action2', 'export_form', 'id', 'lead', 'order', 'post', 'post_ID', 'user', 'users'];
@@ -58,12 +68,15 @@ class Recorder
         add_action('user_register', [$this, 'onUserCreated']);
         add_action('deleted_user', [$this, 'onUserDeleted']);
         add_action('set_user_role', [$this, 'onRoleChanged'], 10, 3);
+        add_action('add_user_role', fn ($userId = 0, $role = '') => $this->event('change', 'role_added', ['target_user_id' => (int) $userId, 'role' => (string) $role]), 10, 2);
+        add_action('remove_user_role', fn ($userId = 0, $role = '') => $this->event('change', 'role_removed', ['target_user_id' => (int) $userId, 'role' => (string) $role]), 10, 2);
         add_action('profile_update', [$this, 'onProfileUpdated'], 10, 2);
         add_action('activated_plugin', fn ($plugin = '') => $this->event('change', 'plugin_activated', ['plugin' => (string) $plugin]));
         add_action('deactivated_plugin', fn ($plugin = '') => $this->event('change', 'plugin_deactivated', ['plugin' => (string) $plugin]));
         add_action('upgrader_process_complete', [$this, 'onUpgrade'], 10, 2);
         add_action('switch_theme', fn ($name = '') => $this->event('change', 'theme_switched', ['theme' => (string) $name]));
         add_action('updated_option', [$this, 'onOptionUpdated'], 10, 3);
+        add_action('update_site_option', [$this, 'onNetworkOptionUpdated'], 10, 3);
 
         add_action('woocommerce_order_status_changed', [$this, 'onOrderStatusChanged'], 10, 3);
         add_action('woocommerce_order_refunded', fn ($orderId = 0, $refundId = 0) => $this->event('change', 'order_refunded', [
@@ -72,6 +85,8 @@ class Recorder
         ]), 10, 2);
 
         add_filter('rest_request_after_callbacks', [$this, 'onRestCall'], 10, 3);
+        // After WooCommerce reports its own authentication errors at 15.
+        add_filter('rest_authentication_errors', [$this, 'onRestAuthenticationError'], 16);
 
         // After WordPress has flushed its output buffers, so the upload runs
         // once the response is already on its way to the visitor.
@@ -108,6 +123,13 @@ class Recorder
     public function onLoggedInCookie($cookie = '', $expire = 0, $expiration = 0, $userId = 0, $scheme = '', $token = ''): void
     {
         $this->loginToken = is_string($token) && $token !== '' ? $token : null;
+
+        // Separate from wp_login, which code that signs a user in by calling
+        // wp_set_auth_cookie() directly, such as an auth bypass, never fires.
+        $this->event('auth', 'auth_cookie_issued', [
+            'target_user_id' => (int) $userId,
+            'session' => $this->loginToken ? hash('sha256', $this->loginToken) : null,
+        ]);
     }
 
     public function onLogin($login = '', $user = null): void
@@ -186,8 +208,20 @@ class Recorder
 
     public function onOptionUpdated($option = '', $old = null, $new = null): void
     {
+        global $wpdb;
+
         if (in_array($option, self::WATCHED_OPTIONS, true)) {
             $this->event('change', 'option_updated', ['option' => $option, 'old' => $old, 'new' => $new]);
+        } elseif ($option === $wpdb->prefix.'user_roles') {
+            // Which capabilities each role has; too large to store the values.
+            $this->event('change', 'role_definitions_changed');
+        }
+    }
+
+    public function onNetworkOptionUpdated($option = '', $new = null, $old = null): void
+    {
+        if (in_array($option, self::WATCHED_NETWORK_OPTIONS, true)) {
+            $this->event('change', 'network_option_updated', ['option' => $option, 'old' => $old, 'new' => $new]);
         }
     }
 
@@ -211,9 +245,40 @@ class Recorder
             'method' => $request->get_method(),
             'route' => $request->get_route(),
             'id' => is_scalar($id) ? (string) $id : null,
+            'status' => self::responseStatus($response),
         ];
 
         return $response;
+    }
+
+    /**
+     * The status tells a call that returned data from one that was denied.
+     */
+    private static function responseStatus($response): int
+    {
+        if (is_wp_error($response)) {
+            return (int) ($response->get_error_data()['status'] ?? 500);
+        }
+
+        return $response instanceof \WP_HTTP_Response ? $response->get_status() : 200;
+    }
+
+    /**
+     * WooCommerce rejects a bad API key without firing any action of its own.
+     */
+    public function onRestAuthenticationError($error = null)
+    {
+        if (is_wp_error($error) && str_starts_with((string) $error->get_error_code(), 'woocommerce_rest_authentication')) {
+            $consumerKey = self::consumerKey();
+
+            $this->event('auth', 'woocommerce_key_failed', [
+                'error' => $error->get_error_code(),
+                // The same hash WooCommerce stores in woocommerce_api_keys.consumer_key.
+                'key_hash' => $consumerKey && function_exists('wc_api_hash') ? wc_api_hash(sanitize_text_field($consumerKey)) : null,
+            ]);
+        }
+
+        return $error;
     }
 
     /**
@@ -234,28 +299,16 @@ class Recorder
     }
 
     /**
-     * Requests with no allowed Host are dropped. For HTTP that is enough:
-     * Kinsta routes by Host, so a live hostname never reaches staging. WP-CLI
-     * and system cron take HTTP_HOST from WP_HOME instead, which a staging
-     * restore copies from live, so those also need this server's own access
-     * log to show live traffic.
+     * What keeps staging and DDEV out is this server's own access log showing
+     * live traffic, not the request's Host. A Host check would also drop
+     * requests made through another hostname that reaches the live site, such
+     * as the Kinsta temporary domain, which is what an attacker would pick.
+     * Those are recorded, with their real host.
      */
     private function send(): void
     {
-        $host = strtolower((string) ($_SERVER['HTTP_HOST'] ?? ''));
-        if (! $this->config->allowsHost($host)) {
-            return;
-        }
-
         if (! $this->events && ! is_user_logged_in()) {
             return;
-        }
-
-        if (self::context() !== 'http') {
-            $dir = LogShipper::logDir($this->config);
-            if (! $dir || ! LogShipper::servesHosts($dir, $this->config)) {
-                return;
-            }
         }
 
         $request = $this->requestRecord();
@@ -276,16 +329,21 @@ class Recorder
             fastcgi_finish_request();
         }
 
-        $body = implode("\n", array_map('wp_json_encode', $records))."\n";
-        $object = sprintf(
-            '%s/events/%s/%s.ndjson',
-            $this->config->site,
-            gmdate('Y-m-d/H'),
-            gmdate('His').'-'.bin2hex(random_bytes(8)),
-        );
+        $dir = LogShipper::logDir($this->config);
+        if (! $dir || ! LogShipper::servesHosts($dir, $this->config)) {
+            return;
+        }
 
-        if ($this->uploader->put($object, $body, 'application/x-ndjson', 3) === Uploader::FAILED) {
-            Retry::push($object, $body);
+        $body = implode("\n", array_map('wp_json_encode', $records))."\n";
+
+        if (! array_diff(array_column($records, 'event'), self::QUEUED_EVENTS)) {
+            Retry::push($body);
+
+            return;
+        }
+
+        if ($this->uploader->put($this->uploader->eventObject(), $body, 'application/x-ndjson', 3) === Uploader::FAILED) {
+            Retry::push($body);
         }
     }
 
@@ -306,7 +364,8 @@ class Recorder
             'context' => self::context(),
             'time' => gmdate('Y-m-d\TH:i:s.v\Z'),
             'request_time' => gmdate('Y-m-d\TH:i:s', (int) ($_SERVER['REQUEST_TIME'] ?? time())).'Z',
-            'host' => strtolower((string) ($_SERVER['HTTP_HOST'] ?? '')),
+            // Kinsta's HTTP_HOST can carry a port; the access log's host field doesn't.
+            'host' => strtolower((string) preg_replace('/:\d+$/', '', (string) ($_SERVER['HTTP_HOST'] ?? ''))),
             'ip' => (string) ($_SERVER['REMOTE_ADDR'] ?? ''),
             'user_agent' => (string) ($_SERVER['HTTP_USER_AGENT'] ?? ''),
             'method' => (string) ($_SERVER['REQUEST_METHOD'] ?? ''),
@@ -342,8 +401,8 @@ class Recorder
 
         $userId = get_current_user_id();
 
-        $consumerKey = $_SERVER['PHP_AUTH_USER'] ?? $_GET['consumer_key'] ?? null;
-        if (is_string($consumerKey) && str_starts_with($consumerKey, 'ck_')) {
+        $consumerKey = self::consumerKey();
+        if ($consumerKey) {
             $keyId = $this->woocommerceKeyId($consumerKey, $userId);
             if ($keyId !== null) {
                 return $this->credential = ['method' => 'woocommerce_api_key', 'key_id' => $keyId];
@@ -360,6 +419,13 @@ class Recorder
         }
 
         return $this->credential = ['method' => 'other'];
+    }
+
+    private static function consumerKey(): ?string
+    {
+        $consumerKey = $_SERVER['PHP_AUTH_USER'] ?? $_GET['consumer_key'] ?? null;
+
+        return is_string($consumerKey) && str_starts_with($consumerKey, 'ck_') ? $consumerKey : null;
     }
 
     private function woocommerceKeyId(string $consumerKey, int $userId): ?int
@@ -401,7 +467,11 @@ class Recorder
     {
         $script = basename((string) ($_SERVER['SCRIPT_NAME'] ?? ''));
 
-        if ($script === 'admin-ajax.php' && preg_match(self::LOOPBACK_ACTIONS, (string) ($_REQUEST['action'] ?? ''))) {
+        if ($script === 'admin-ajax.php' && preg_match(self::NOISE_ACTIONS, (string) ($_REQUEST['action'] ?? ''))) {
+            return false;
+        }
+
+        if (! is_admin() && ($this->credential()['method'] ?? null) === 'cookie' && self::onlyCartCalls($this->restCalls)) {
             return false;
         }
 
@@ -411,6 +481,23 @@ class Recorder
             || in_array($script, ['admin-post.php', 'wp-login.php'], true)
             || ($this->credential()['method'] ?? null) !== 'cookie'
             || (function_exists('is_account_page') && is_account_page());
+    }
+
+    /**
+     * A batch counts only if everything inside it is a cart call too, so
+     * checkout or order routes in a batch are still recorded.
+     *
+     * @param  array<int, array<string, mixed>>  $calls
+     */
+    public static function onlyCartCalls(array $calls): bool
+    {
+        foreach ($calls as $call) {
+            if (! preg_match(self::CART_ROUTES, (string) ($call['route'] ?? ''))) {
+                return false;
+            }
+        }
+
+        return $calls !== [];
     }
 
     /**

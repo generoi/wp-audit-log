@@ -36,30 +36,31 @@ class LogFilesTest extends TestCase
         ], LogShipper::rotatedFiles("{$this->root}/logs"));
     }
 
-    public function test_pack_redacts_compresses_and_counts_allowed_hosts(): void
+    public function test_pack_redacts_and_compresses(): void
     {
         $this->log('access.log-2026-10-19-1', self::line('www.example.fi', '/wp-json/wc/v3/orders?consumer_secret=cs_x')
             .self::line('example.kinsta.cloud'));
 
-        $packed = LogShipper::pack("{$this->root}/logs/access.log-2026-10-19-1", self::config());
+        $packed = LogShipper::pack("{$this->root}/logs/access.log-2026-10-19-1");
         $plain = gzdecode($packed['body']);
 
-        $this->assertSame(1, $packed['allowed_lines']);
         $this->assertStringContainsString('consumer_secret=REDACTED', $plain);
         $this->assertStringNotContainsString('cs_x', $plain);
+        $this->assertStringContainsString('example.kinsta.cloud', $plain);
         $this->assertSame(hash('sha256', $plain), $packed['sha256']);
-    }
-
-    public function test_pack_finds_no_allowed_lines_in_staging_log(): void
-    {
-        $this->log('access.log-2026-10-19-1', self::line('stg-example-staging.kinsta.cloud'));
-
-        $this->assertSame(0, LogShipper::pack("{$this->root}/logs/access.log-2026-10-19-1", self::config())['allowed_lines']);
     }
 
     public function test_pack_returns_null_for_unreadable_file(): void
     {
-        $this->assertNull(LogShipper::pack("{$this->root}/logs/missing", self::config()));
+        $this->assertNull(LogShipper::pack("{$this->root}/logs/missing"));
+    }
+
+    public function test_pack_returns_null_when_the_compressed_body_is_too_large(): void
+    {
+        // Random, so it doesn't compress; deflate flushes output in blocks.
+        $this->log('access.log-2026-10-19-1', bin2hex(random_bytes(200000))."\n");
+
+        $this->assertNull(LogShipper::pack("{$this->root}/logs/access.log-2026-10-19-1", 1));
     }
 
     public function test_serves_hosts_reads_this_servers_log(): void
@@ -75,6 +76,14 @@ class LogFilesTest extends TestCase
     {
         $this->log('access.log', '');
         $this->log('access.log-2026-10-18-1', self::line('stg-example-staging.kinsta.cloud'));
+        $this->log('access.log-2026-10-19-2', self::line('www.example.fi'));
+
+        $this->assertTrue(LogShipper::servesHosts("{$this->root}/logs", self::config()));
+    }
+
+    public function test_serves_hosts_is_not_fooled_by_other_hosts_filling_the_live_tail(): void
+    {
+        $this->log('access.log', self::line('example.kinsta.cloud'));
         $this->log('access.log-2026-10-19-2', self::line('www.example.fi'));
 
         $this->assertTrue(LogShipper::servesHosts("{$this->root}/logs", self::config()));

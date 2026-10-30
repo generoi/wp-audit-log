@@ -12,43 +12,57 @@ class RetryTest extends TestCase
     {
         global $wpdb;
 
-        Retry::push('example/a', 'x');
+        Retry::push("a\n");
 
-        $autoload = $wpdb->get_var("SELECT autoload FROM {$wpdb->options} WHERE option_name = 'wp_audit_log_retry'");
+        $autoload = $wpdb->get_var("SELECT autoload FROM {$wpdb->options} WHERE option_name LIKE 'wp\_audit\_log\_retry\_%'");
         $this->assertContains($autoload, ['no', 'off']);
     }
 
-    public function test_queue_keeps_the_newest_500(): void
+    public function test_flush_merges_batches_into_one_upload_and_empties_the_queue(): void
     {
-        for ($i = 0; $i < 510; $i++) {
-            Retry::push("example/{$i}", 'x');
-        }
-
-        $queue = get_option('wp_audit_log_retry');
-        $this->assertCount(500, $queue);
-        $this->assertArrayHasKey('example/509', $queue);
-        $this->assertArrayNotHasKey('example/9', $queue);
-    }
-
-    public function test_flush_uploads_and_empties_the_queue(): void
-    {
-        Retry::push('example/a', 'a');
-        Retry::push('example/b', 'b');
+        Retry::push("a\n");
+        Retry::push("b\n");
 
         $this->assertTrue(Retry::flush(new Uploader(self::config())));
+
         $this->assertSame(0, Retry::count());
-        $this->assertCount(2, $this->uploads());
+        $this->assertCount(1, $this->uploads());
+        $this->assertSame("a\nb\n", $this->uploads()[0]['body']);
     }
 
-    public function test_flush_stops_at_first_failure_and_keeps_the_rest(): void
+    public function test_failed_flush_keeps_the_queue(): void
     {
-        Retry::push('example/a', 'a');
-        Retry::push('example/b', 'b');
-        Retry::push('example/c', 'c');
+        Retry::push("a\n");
+        Retry::push("b\n");
 
-        $this->respond(200, 503);
+        $this->respond(503);
+
         $this->assertFalse(Retry::flush(new Uploader(self::config())));
+        $this->assertSame(2, Retry::count());
+    }
 
-        $this->assertSame(['example/b', 'example/c'], array_keys(get_option('wp_audit_log_retry')));
+    public function test_trim_drops_nothing_under_the_cap(): void
+    {
+        Retry::push("a\n");
+
+        $this->assertSame(0, Retry::trim());
+        $this->assertSame(1, Retry::count());
+    }
+
+    public function test_trim_drops_the_oldest_past_the_cap(): void
+    {
+        global $wpdb;
+
+        Retry::push("oldest\n");
+        $wpdb->query("INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
+            SELECT CONCAT('wp_audit_log_retry_', a.n, b.n, c.n, d.n), 'x', 'off'
+            FROM (SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+            (SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
+            (SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c,
+            (SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d");
+
+        $this->assertSame(1, Retry::trim());
+        $this->assertSame(10000, Retry::count());
+        $this->assertNull($wpdb->get_var("SELECT option_id FROM {$wpdb->options} WHERE option_value = 'oldest\n'"));
     }
 }

@@ -31,16 +31,47 @@ class LogShipperTest extends TestCase
         $this->assertEqualsWithDelta(time(), get_site_option('wp_audit_log_last_success'), 2);
     }
 
-    public function test_file_without_our_hosts_is_skipped_and_does_not_block_others(): void
+    public function test_live_uploads_files_with_only_other_hosts(): void
     {
-        $this->log('access.log-2026-10-18-1', self::line('stg-example-staging.kinsta.cloud'));
-        $this->log('access.log-2026-10-19-2', self::line('www.example.fi'));
+        $this->log('access.log', self::line('www.example.fi'));
+        $this->log('access.log-2026-10-18-1', self::line('example.kinsta.cloud'));
 
         $this->ship();
 
         $this->assertCount(1, $this->uploads());
-        $this->assertArrayNotHasKey('access.log-2026-10-18-1', get_site_option('wp_audit_log_shipped'));
+        $this->assertEqualsWithDelta(time(), get_site_option('wp_audit_log_last_success'), 2);
+    }
+
+    public function test_staging_copy_uploads_nothing_and_does_not_alert(): void
+    {
+        update_site_option('wp_audit_log_first_seen', time() - 40 * HOUR_IN_SECONDS);
+        $this->log('access.log', self::line('stg-example-staging.kinsta.cloud'));
+        $this->log('access.log-2026-10-18-1', self::line('stg-example-staging.kinsta.cloud'));
+
+        $this->ship(['chatWebhook' => 'https://chat.example/hook']);
+
+        $this->assertSame([], $this->requests);
+    }
+
+    public function test_finding_nothing_to_ship_is_not_a_success(): void
+    {
+        $this->log('access.log', self::line('www.example.fi'));
+        $this->log('access.log-renamed-by-kinsta.gz', 'x');
+
+        $this->ship();
+
         $this->assertFalse(get_site_option('wp_audit_log_last_success'));
+    }
+
+    public function test_progress_survives_a_later_failure(): void
+    {
+        $this->log('access.log-2026-10-18-1', self::line('www.example.fi'));
+        $this->log('access.log-2026-10-19-2', self::line('www.example.fi'));
+
+        $this->respond(200, 503);
+        $this->ship();
+
+        $this->assertSame(['access.log-2026-10-18-1'], array_keys(get_site_option('wp_audit_log_shipped')));
     }
 
     public function test_upload_failure_stops_the_run_and_retries_next_time(): void
